@@ -1,12 +1,53 @@
 name: CI Joomla
 
+# racecar fork-testbed patch. Changes from upstream:
+#   1. workflow_dispatch with a `leg` input so racecar can drive the run and pick
+#      baseline vs instrumented.
+#   2. actions/checkout -> crashappsec/action-checkout, which wraps checkout and
+#      setup-chalk-action; `chalk:` is the only variable separating the arms.
+#   3. permissions: id-token: write for the action's OIDC connect (the block
+#      zeroes unlisted scopes, so everything upstream relied on is restated).
+#   4. A fail-closed assertion on the instrumented arm.
+#   5. fail-fast: false on every matrix -- a measurement-integrity change, not a
+#      build change: the instrumented arm has strictly more failure surface, so
+#      leaving fail-fast on cancels instrumented siblings more often than
+#      baseline ones and biases the comparison.
+#   6. the concurrency group carries the leg. Both arms run on the same ref, so
+#      upstream's github.ref-keyed group put them in one group and the second
+#      dispatch cancelled the first. Also cancellation-only, never a build change.
+# Build and test COMMANDS are unchanged from upstream.
+
+run-name: "CI Joomla ${{ inputs.leg || 'push' }} ${{ inputs.racecar_run }}"
+
 on:
+  workflow_dispatch:
+    inputs:
+      leg:
+        description: "baseline (uninstrumented) or instrumented (under chalk/curiosity)"
+        type: choice
+        options: [instrumented, baseline]
+        default: instrumented
+      profile:
+        description: "CrashOverride chalk profile"
+        type: string
+        default: curiosity-tests-racecar
+      racecar_run:
+        description: "racecar correlation token, echoed into the run name"
+        type: string
+        default: ""
   push:
   pull_request:
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ inputs.leg || 'push' }}
   cancel-in-progress: true
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  CHALK_ON: ${{ github.event_name == 'workflow_dispatch' && inputs.leg != 'baseline' }}
 
 jobs:
   composer:
@@ -14,7 +55,37 @@ jobs:
     runs-on: ubuntu-latest
     container: joomlaprojects/docker-images:php8.5
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Prepare container for action-checkout
+        # action-checkout needs bash (its Detect LFS step exits 127 without
+        # it) and curl: the is_private probe shells `curl -fsSLI` and reads
+        # ANY non-zero exit as "private", which routes to a private action
+        # this fork cannot resolve. Ungated so both arms pay the same setup
+        # cost -- an asymmetric cost between arms would bias the comparison.
+        # Best-effort: it must never fail a job that builds fine without it.
+        run: |
+          if command -v apk >/dev/null 2>&1; then apk add --no-cache bash curl
+          elif command -v microdnf >/dev/null 2>&1; then microdnf -y install bash curl
+          elif command -v dnf >/dev/null 2>&1; then dnf -y install bash curl
+          elif command -v yum >/dev/null 2>&1; then yum -y install bash curl
+          elif command -v apt-get >/dev/null 2>&1; then apt-get -q update && apt-get -q -y install bash curl
+          fi || echo "prep: package install failed, continuing"
+
+      - uses: crashappsec/action-checkout@main
+        with:
+          chalk: ${{ env.CHALK_ON }}
+          profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
+          observables_continue_on_error: false
+          lfs: false
+
+      - name: Assert instrumentation is live
+        # Socket existence, not LD_PRELOAD: co-monitor's loader clears
+        # LD_PRELOAD once it has injected, so an empty value is what success
+        # looks like. co-hostd also daemonizes, so pgrep does not match it.
+        if: env.CHALK_ON == 'true'
+        run: |
+          test -n "${CURIOSITY_ROOT:-}" || { echo "::error::CURIOSITY_ROOT unset - observables never installed"; exit 1; }
+          test -S "${CURIOSITY_SOCKET_NAME:?socket name unset}" || { echo "::error::co-hostd socket absent"; exit 1; }
+
       - uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         id: cache-php
         with:
@@ -37,7 +108,37 @@ jobs:
       - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
         with:
           node-version: latest
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Prepare container for action-checkout
+        # action-checkout needs bash (its Detect LFS step exits 127 without
+        # it) and curl: the is_private probe shells `curl -fsSLI` and reads
+        # ANY non-zero exit as "private", which routes to a private action
+        # this fork cannot resolve. Ungated so both arms pay the same setup
+        # cost -- an asymmetric cost between arms would bias the comparison.
+        # Best-effort: it must never fail a job that builds fine without it.
+        run: |
+          if command -v apk >/dev/null 2>&1; then apk add --no-cache bash curl
+          elif command -v microdnf >/dev/null 2>&1; then microdnf -y install bash curl
+          elif command -v dnf >/dev/null 2>&1; then dnf -y install bash curl
+          elif command -v yum >/dev/null 2>&1; then yum -y install bash curl
+          elif command -v apt-get >/dev/null 2>&1; then apt-get -q update && apt-get -q -y install bash curl
+          fi || echo "prep: package install failed, continuing"
+
+      - uses: crashappsec/action-checkout@main
+        with:
+          chalk: ${{ env.CHALK_ON }}
+          profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
+          observables_continue_on_error: false
+          lfs: false
+
+      - name: Assert instrumentation is live
+        # Socket existence, not LD_PRELOAD: co-monitor's loader clears
+        # LD_PRELOAD once it has injected, so an empty value is what success
+        # looks like. co-hostd also daemonizes, so pgrep does not match it.
+        if: env.CHALK_ON == 'true'
+        run: |
+          test -n "${CURIOSITY_ROOT:-}" || { echo "::error::CURIOSITY_ROOT unset - observables never installed"; exit 1; }
+          test -S "${CURIOSITY_SOCKET_NAME:?socket name unset}" || { echo "::error::co-hostd socket absent"; exit 1; }
+
       - uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         id: cache-assets
         with:
@@ -60,7 +161,37 @@ jobs:
     container: joomlaprojects/docker-images:php8.5
     needs: [composer]
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Prepare container for action-checkout
+        # action-checkout needs bash (its Detect LFS step exits 127 without
+        # it) and curl: the is_private probe shells `curl -fsSLI` and reads
+        # ANY non-zero exit as "private", which routes to a private action
+        # this fork cannot resolve. Ungated so both arms pay the same setup
+        # cost -- an asymmetric cost between arms would bias the comparison.
+        # Best-effort: it must never fail a job that builds fine without it.
+        run: |
+          if command -v apk >/dev/null 2>&1; then apk add --no-cache bash curl
+          elif command -v microdnf >/dev/null 2>&1; then microdnf -y install bash curl
+          elif command -v dnf >/dev/null 2>&1; then dnf -y install bash curl
+          elif command -v yum >/dev/null 2>&1; then yum -y install bash curl
+          elif command -v apt-get >/dev/null 2>&1; then apt-get -q update && apt-get -q -y install bash curl
+          fi || echo "prep: package install failed, continuing"
+
+      - uses: crashappsec/action-checkout@main
+        with:
+          chalk: ${{ env.CHALK_ON }}
+          profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
+          observables_continue_on_error: false
+          lfs: false
+
+      - name: Assert instrumentation is live
+        # Socket existence, not LD_PRELOAD: co-monitor's loader clears
+        # LD_PRELOAD once it has injected, so an empty value is what success
+        # looks like. co-hostd also daemonizes, so pgrep does not match it.
+        if: env.CHALK_ON == 'true'
+        run: |
+          test -n "${CURIOSITY_ROOT:-}" || { echo "::error::CURIOSITY_ROOT unset - observables never installed"; exit 1; }
+          test -S "${CURIOSITY_SOCKET_NAME:?socket name unset}" || { echo "::error::co-hostd socket absent"; exit 1; }
+
       - uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: libraries/vendor
@@ -86,13 +217,44 @@ jobs:
     container: joomlaprojects/docker-images:php8.5
     needs: [composer, npm]
     strategy:
+      fail-fast: false
       matrix:
         check: ['lint:js', 'lint:testjs', 'lint:css']
     steps:
       - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
         with:
           node-version: latest
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Prepare container for action-checkout
+        # action-checkout needs bash (its Detect LFS step exits 127 without
+        # it) and curl: the is_private probe shells `curl -fsSLI` and reads
+        # ANY non-zero exit as "private", which routes to a private action
+        # this fork cannot resolve. Ungated so both arms pay the same setup
+        # cost -- an asymmetric cost between arms would bias the comparison.
+        # Best-effort: it must never fail a job that builds fine without it.
+        run: |
+          if command -v apk >/dev/null 2>&1; then apk add --no-cache bash curl
+          elif command -v microdnf >/dev/null 2>&1; then microdnf -y install bash curl
+          elif command -v dnf >/dev/null 2>&1; then dnf -y install bash curl
+          elif command -v yum >/dev/null 2>&1; then yum -y install bash curl
+          elif command -v apt-get >/dev/null 2>&1; then apt-get -q update && apt-get -q -y install bash curl
+          fi || echo "prep: package install failed, continuing"
+
+      - uses: crashappsec/action-checkout@main
+        with:
+          chalk: ${{ env.CHALK_ON }}
+          profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
+          observables_continue_on_error: false
+          lfs: false
+
+      - name: Assert instrumentation is live
+        # Socket existence, not LD_PRELOAD: co-monitor's loader clears
+        # LD_PRELOAD once it has injected, so an empty value is what success
+        # looks like. co-hostd also daemonizes, so pgrep does not match it.
+        if: env.CHALK_ON == 'true'
+        run: |
+          test -n "${CURIOSITY_ROOT:-}" || { echo "::error::CURIOSITY_ROOT unset - observables never installed"; exit 1; }
+          test -S "${CURIOSITY_SOCKET_NAME:?socket name unset}" || { echo "::error::co-hostd socket absent"; exit 1; }
+
       - uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: |
@@ -109,7 +271,37 @@ jobs:
     container: joomlaprojects/docker-images:php8.5
     needs: [code-style-php]
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Prepare container for action-checkout
+        # action-checkout needs bash (its Detect LFS step exits 127 without
+        # it) and curl: the is_private probe shells `curl -fsSLI` and reads
+        # ANY non-zero exit as "private", which routes to a private action
+        # this fork cannot resolve. Ungated so both arms pay the same setup
+        # cost -- an asymmetric cost between arms would bias the comparison.
+        # Best-effort: it must never fail a job that builds fine without it.
+        run: |
+          if command -v apk >/dev/null 2>&1; then apk add --no-cache bash curl
+          elif command -v microdnf >/dev/null 2>&1; then microdnf -y install bash curl
+          elif command -v dnf >/dev/null 2>&1; then dnf -y install bash curl
+          elif command -v yum >/dev/null 2>&1; then yum -y install bash curl
+          elif command -v apt-get >/dev/null 2>&1; then apt-get -q update && apt-get -q -y install bash curl
+          fi || echo "prep: package install failed, continuing"
+
+      - uses: crashappsec/action-checkout@main
+        with:
+          chalk: ${{ env.CHALK_ON }}
+          profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
+          observables_continue_on_error: false
+          lfs: false
+
+      - name: Assert instrumentation is live
+        # Socket existence, not LD_PRELOAD: co-monitor's loader clears
+        # LD_PRELOAD once it has injected, so an empty value is what success
+        # looks like. co-hostd also daemonizes, so pgrep does not match it.
+        if: env.CHALK_ON == 'true'
+        run: |
+          test -n "${CURIOSITY_ROOT:-}" || { echo "::error::CURIOSITY_ROOT unset - observables never installed"; exit 1; }
+          test -S "${CURIOSITY_SOCKET_NAME:?socket name unset}" || { echo "::error::co-hostd socket absent"; exit 1; }
+
       - uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: libraries/vendor
@@ -134,10 +326,41 @@ jobs:
     container: joomlaprojects/docker-images:php${{ matrix.php_version }}
     needs: [code-style-php]
     strategy:
+      fail-fast: false
       matrix:
         php_version: ['8.1', '8.2', '8.3', '8.4', '8.5']
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Prepare container for action-checkout
+        # action-checkout needs bash (its Detect LFS step exits 127 without
+        # it) and curl: the is_private probe shells `curl -fsSLI` and reads
+        # ANY non-zero exit as "private", which routes to a private action
+        # this fork cannot resolve. Ungated so both arms pay the same setup
+        # cost -- an asymmetric cost between arms would bias the comparison.
+        # Best-effort: it must never fail a job that builds fine without it.
+        run: |
+          if command -v apk >/dev/null 2>&1; then apk add --no-cache bash curl
+          elif command -v microdnf >/dev/null 2>&1; then microdnf -y install bash curl
+          elif command -v dnf >/dev/null 2>&1; then dnf -y install bash curl
+          elif command -v yum >/dev/null 2>&1; then yum -y install bash curl
+          elif command -v apt-get >/dev/null 2>&1; then apt-get -q update && apt-get -q -y install bash curl
+          fi || echo "prep: package install failed, continuing"
+
+      - uses: crashappsec/action-checkout@main
+        with:
+          chalk: ${{ env.CHALK_ON }}
+          profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
+          observables_continue_on_error: false
+          lfs: false
+
+      - name: Assert instrumentation is live
+        # Socket existence, not LD_PRELOAD: co-monitor's loader clears
+        # LD_PRELOAD once it has injected, so an empty value is what success
+        # looks like. co-hostd also daemonizes, so pgrep does not match it.
+        if: env.CHALK_ON == 'true'
+        run: |
+          test -n "${CURIOSITY_ROOT:-}" || { echo "::error::CURIOSITY_ROOT unset - observables never installed"; exit 1; }
+          test -S "${CURIOSITY_SOCKET_NAME:?socket name unset}" || { echo "::error::co-hostd socket absent"; exit 1; }
+
       - uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: libraries/vendor
@@ -151,6 +374,7 @@ jobs:
     container: joomlaprojects/docker-images:php${{ matrix.php_version }}
     needs: [code-style-php]
     strategy:
+      fail-fast: false
       matrix:
         php_version: ['8.1', '8.2', '8.3', '8.4', '8.5']
         config:
@@ -183,7 +407,37 @@ jobs:
             host: 'postgres'
             user: 'root'
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Prepare container for action-checkout
+        # action-checkout needs bash (its Detect LFS step exits 127 without
+        # it) and curl: the is_private probe shells `curl -fsSLI` and reads
+        # ANY non-zero exit as "private", which routes to a private action
+        # this fork cannot resolve. Ungated so both arms pay the same setup
+        # cost -- an asymmetric cost between arms would bias the comparison.
+        # Best-effort: it must never fail a job that builds fine without it.
+        run: |
+          if command -v apk >/dev/null 2>&1; then apk add --no-cache bash curl
+          elif command -v microdnf >/dev/null 2>&1; then microdnf -y install bash curl
+          elif command -v dnf >/dev/null 2>&1; then dnf -y install bash curl
+          elif command -v yum >/dev/null 2>&1; then yum -y install bash curl
+          elif command -v apt-get >/dev/null 2>&1; then apt-get -q update && apt-get -q -y install bash curl
+          fi || echo "prep: package install failed, continuing"
+
+      - uses: crashappsec/action-checkout@main
+        with:
+          chalk: ${{ env.CHALK_ON }}
+          profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
+          observables_continue_on_error: false
+          lfs: false
+
+      - name: Assert instrumentation is live
+        # Socket existence, not LD_PRELOAD: co-monitor's loader clears
+        # LD_PRELOAD once it has injected, so an empty value is what success
+        # looks like. co-hostd also daemonizes, so pgrep does not match it.
+        if: env.CHALK_ON == 'true'
+        run: |
+          test -n "${CURIOSITY_ROOT:-}" || { echo "::error::CURIOSITY_ROOT unset - observables never installed"; exit 1; }
+          test -S "${CURIOSITY_SOCKET_NAME:?socket name unset}" || { echo "::error::co-hostd socket absent"; exit 1; }
+
       - name: Start LDAP container
         uses: docker://docker
         with:
@@ -229,14 +483,32 @@ jobs:
           POSTGRES_DB: test_joomla
 
   tests-unit-windows:
+    # racecar: non-Linux leg: observables are linux-only
+    if: false
     name: Run Unit tests (Windows)
     runs-on: windows-latest
     needs: [code-style-php]
     strategy:
+      fail-fast: false
       matrix:
         php_version: ['8.1', '8.2', '8.3', '8.4', '8.5']
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: crashappsec/action-checkout@main
+        with:
+          chalk: ${{ env.CHALK_ON }}
+          profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
+          observables_continue_on_error: false
+          lfs: false
+
+      - name: Assert instrumentation is live
+        # Socket existence, not LD_PRELOAD: co-monitor's loader clears
+        # LD_PRELOAD once it has injected, so an empty value is what success
+        # looks like. co-hostd also daemonizes, so pgrep does not match it.
+        if: env.CHALK_ON == 'true'
+        run: |
+          test -n "${CURIOSITY_ROOT:-}" || { echo "::error::CURIOSITY_ROOT unset - observables never installed"; exit 1; }
+          test -S "${CURIOSITY_SOCKET_NAME:?socket name unset}" || { echo "::error::co-hostd socket absent"; exit 1; }
+
       - uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         id: cache-php-windows
         with:
@@ -255,14 +527,32 @@ jobs:
         run: php libraries/vendor/bin/phpunit --testsuite Unit
 
   tests-integration-windows:
+    # racecar: non-Linux leg: observables are linux-only
+    if: false
     name: Run integration tests (Windows)
     runs-on: windows-latest
     needs: [code-style-php]
     strategy:
+      fail-fast: false
       matrix:
         php_version: ['8.1', '8.2', '8.3', '8.4', '8.5']
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: crashappsec/action-checkout@main
+        with:
+          chalk: ${{ env.CHALK_ON }}
+          profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
+          observables_continue_on_error: false
+          lfs: false
+
+      - name: Assert instrumentation is live
+        # Socket existence, not LD_PRELOAD: co-monitor's loader clears
+        # LD_PRELOAD once it has injected, so an empty value is what success
+        # looks like. co-hostd also daemonizes, so pgrep does not match it.
+        if: env.CHALK_ON == 'true'
+        run: |
+          test -n "${CURIOSITY_ROOT:-}" || { echo "::error::CURIOSITY_ROOT unset - observables never installed"; exit 1; }
+          test -S "${CURIOSITY_SOCKET_NAME:?socket name unset}" || { echo "::error::co-hostd socket absent"; exit 1; }
+
       - uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: libraries/vendor
@@ -297,7 +587,37 @@ jobs:
     env:
       CYPRESS_VERIFY_TIMEOUT: 100000
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Prepare container for action-checkout
+        # action-checkout needs bash (its Detect LFS step exits 127 without
+        # it) and curl: the is_private probe shells `curl -fsSLI` and reads
+        # ANY non-zero exit as "private", which routes to a private action
+        # this fork cannot resolve. Ungated so both arms pay the same setup
+        # cost -- an asymmetric cost between arms would bias the comparison.
+        # Best-effort: it must never fail a job that builds fine without it.
+        run: |
+          if command -v apk >/dev/null 2>&1; then apk add --no-cache bash curl
+          elif command -v microdnf >/dev/null 2>&1; then microdnf -y install bash curl
+          elif command -v dnf >/dev/null 2>&1; then dnf -y install bash curl
+          elif command -v yum >/dev/null 2>&1; then yum -y install bash curl
+          elif command -v apt-get >/dev/null 2>&1; then apt-get -q update && apt-get -q -y install bash curl
+          fi || echo "prep: package install failed, continuing"
+
+      - uses: crashappsec/action-checkout@main
+        with:
+          chalk: ${{ env.CHALK_ON }}
+          profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
+          observables_continue_on_error: false
+          lfs: false
+
+      - name: Assert instrumentation is live
+        # Socket existence, not LD_PRELOAD: co-monitor's loader clears
+        # LD_PRELOAD once it has injected, so an empty value is what success
+        # looks like. co-hostd also daemonizes, so pgrep does not match it.
+        if: env.CHALK_ON == 'true'
+        run: |
+          test -n "${CURIOSITY_ROOT:-}" || { echo "::error::CURIOSITY_ROOT unset - observables never installed"; exit 1; }
+          test -S "${CURIOSITY_SOCKET_NAME:?socket name unset}" || { echo "::error::co-hostd socket absent"; exit 1; }
+
       - uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: |
@@ -324,6 +644,7 @@ jobs:
     container: joomlaprojects/docker-images:cypress${{ matrix.config.php_version }}
     needs: [tests-system-prepare]
     strategy:
+      fail-fast: false
       matrix:
         browser: ['chrome', 'edge']
         config:
@@ -365,7 +686,37 @@ jobs:
     env:
       JOOMLA_INSTALLATION_DISABLE_LOCALHOST_CHECK: 1
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Prepare container for action-checkout
+        # action-checkout needs bash (its Detect LFS step exits 127 without
+        # it) and curl: the is_private probe shells `curl -fsSLI` and reads
+        # ANY non-zero exit as "private", which routes to a private action
+        # this fork cannot resolve. Ungated so both arms pay the same setup
+        # cost -- an asymmetric cost between arms would bias the comparison.
+        # Best-effort: it must never fail a job that builds fine without it.
+        run: |
+          if command -v apk >/dev/null 2>&1; then apk add --no-cache bash curl
+          elif command -v microdnf >/dev/null 2>&1; then microdnf -y install bash curl
+          elif command -v dnf >/dev/null 2>&1; then dnf -y install bash curl
+          elif command -v yum >/dev/null 2>&1; then yum -y install bash curl
+          elif command -v apt-get >/dev/null 2>&1; then apt-get -q update && apt-get -q -y install bash curl
+          fi || echo "prep: package install failed, continuing"
+
+      - uses: crashappsec/action-checkout@main
+        with:
+          chalk: ${{ env.CHALK_ON }}
+          profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
+          observables_continue_on_error: false
+          lfs: false
+
+      - name: Assert instrumentation is live
+        # Socket existence, not LD_PRELOAD: co-monitor's loader clears
+        # LD_PRELOAD once it has injected, so an empty value is what success
+        # looks like. co-hostd also daemonizes, so pgrep does not match it.
+        if: env.CHALK_ON == 'true'
+        run: |
+          test -n "${CURIOSITY_ROOT:-}" || { echo "::error::CURIOSITY_ROOT unset - observables never installed"; exit 1; }
+          test -S "${CURIOSITY_SOCKET_NAME:?socket name unset}" || { echo "::error::co-hostd socket absent"; exit 1; }
+
       - uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: libraries/vendor
@@ -419,7 +770,22 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - name: Checkout Actions Repository
-      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      uses: crashappsec/action-checkout@main
+      with:
+        chalk: ${{ env.CHALK_ON }}
+        profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
+        observables_continue_on_error: false
+        lfs: false
+
+    - name: Assert instrumentation is live
+      # Socket existence, not LD_PRELOAD: co-monitor's loader clears
+      # LD_PRELOAD once it has injected, so an empty value is what success
+      # looks like. co-hostd also daemonizes, so pgrep does not match it.
+      if: env.CHALK_ON == 'true'
+      run: |
+        test -n "${CURIOSITY_ROOT:-}" || { echo "::error::CURIOSITY_ROOT unset - observables never installed"; exit 1; }
+        test -S "${CURIOSITY_SOCKET_NAME:?socket name unset}" || { echo "::error::co-hostd socket absent"; exit 1; }
+
     - name: Spell Check Repository
       uses: crate-ci/typos@7b04f660f4ee4f048d18fd341887cf28dfbedfe2 # v1.46.3
       with:
